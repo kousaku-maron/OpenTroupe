@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import textwrap
-from typing import Any, ClassVar, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, TypedDict
 
 import chevron
 from pydantic import BaseModel
@@ -14,6 +14,9 @@ from opentroupe.utils import post_init, repeat_on_error
 
 from .memory import EpisodicMemory, SemanticMemory
 from .prompts import open_person_prompt_template
+
+if TYPE_CHECKING:
+    from opentroupe.environment import OpenWorld
 
 ###########################################################################
 # Default parameter values
@@ -88,7 +91,7 @@ class OpenPerson:
         Create a OpenPerson.
 
         Args:
-            name (str): The name of the TinyPerson. Either this or spec_path must be specified.
+            name (str): The name of the OpenPerson. Either this or spec_path must be specified.
             episodic_memory (EpisodicMemory, optional): The memory implementation to use. Defaults to EpisodicMemory().
             semantic_memory (SemanticMemory, optional): The memory implementation to use. Defaults to SemanticMemory().
             mental_faculties (list, optional): A list of mental faculties to add to the agent. Defaults to None.
@@ -124,7 +127,7 @@ class OpenPerson:
         self.current_messages: list = []
 
         # the current environment in which the agent is acting
-        self.environment = None
+        self.environment: OpenWorld | None = None
 
         # The list of actions that this agent has performed so far, but which have not been
         # consumed by the environment yet.
@@ -132,7 +135,7 @@ class OpenPerson:
 
         # The list of agents that this agent can currently interact with.
         # This can change over time, as agents move around the world.
-        self._accessible_agents: list[object] = []
+        self._accessible_agents: list[OpenPerson] = []
 
         # the buffer of communications that have been displayed so far, used for
         # saving these communications to another output form later (e.g., caching)
@@ -243,6 +246,31 @@ class OpenPerson:
                 "These actions **MUST** be rendered following the JSON specification perfectly, including all required keys (even if their value is empty), **ALWAYS**.",
             },
         )
+
+    def define(self, key: str | None, value: Any, group: str | None = None) -> None:
+        """
+        Define a value to the OpenPerson's configuration.
+        If group is None, the value is added to the top level of the configuration.
+        Otherwise, the value is added to the specified group.
+        """
+        # dedent value if it is a string
+        if isinstance(value, str):
+            value = textwrap.dedent(value)
+
+        if group is None:
+            self._configuration[key] = value
+        elif key is not None:
+            self._configuration[group].append({key: value})
+        else:
+            self._configuration[group].append(value)
+
+        # must reset prompt after adding to configuration
+        self.reset_prompt()
+
+    def define_several(self, group: str | None, records: list) -> None:
+        """Define several values to the OpenPerson's configuration, all belonging to the same group."""
+        for record in records:
+            self.define(key=None, value=record, group=group)
 
     def retrieve_recent_memories(self, max_content_length: int | None = None) -> list:
         episodes = self.episodic_memory.retrieve_recent()
@@ -364,7 +392,7 @@ class OpenPerson:
     def listen(
         self,
         speech: str,
-        source: str | None = None,
+        source: OpenWorld | OpenPerson | None = None,
         max_content_length: int = default["max_content_display_length"],
     ) -> OpenPerson:
         """
@@ -385,10 +413,34 @@ class OpenPerson:
             max_content_length=max_content_length,
         )
 
+    def socialize(
+        self,
+        social_description: str,
+        source: OpenWorld | OpenPerson | None = None,
+        max_content_length: int = default["max_content_display_length"],
+    ) -> OpenPerson:
+        """
+        Perceives a social stimulus through a description and updates its internal cognitive state.
+
+        Args:
+            social_description (str): The description of the social stimulus.
+            source (AgentOrWorld, optional): The source of the social stimulus. Defaults to None.
+            max_content_length (int, optional): The maximum length of the content. Defaults to default["max_content_display_length"].
+
+        """
+        return self._observe(
+            stimulus={
+                "type": "SOCIAL",
+                "content": social_description,
+                "source": utils.name_or_empty(source),
+            },
+            max_content_length=max_content_length,
+        )
+
     def see(
         self,
         visual_description: str,
-        source: str | None = None,
+        source: OpenWorld | OpenPerson | None = None,
         max_content_length: int = default["max_content_display_length"],
     ) -> OpenPerson:
         """
@@ -494,6 +546,22 @@ class OpenPerson:
             max_content_length=max_content_length,
         )
 
+    def make_agent_accessible(
+        self,
+        agent: OpenPerson,
+        relation_description: str = "An agent I can currently interact with.",
+    ) -> None:
+        """Makes an agent accessible to this agent."""
+        if agent not in self._accessible_agents:
+            self._accessible_agents.append(agent)
+            self._configuration["currently_accessible_agents"].append(
+                {"name": agent.name, "relation_description": relation_description},
+            )
+        else:
+            utils.logger.warning(
+                f"[{self.name}] Agent {agent.name} is already accessible to {self.name}.",
+            )
+
     def _produce_message(self) -> tuple[str, dict]:
         # ensure we have the latest prompt (initial system message + selected messages from memory)
         self.reset_prompt()
@@ -506,6 +574,7 @@ class OpenPerson:
         utils.logger.debug(f"[{self.name}] Sending messages to LLM API")
         utils.logger.debug(f"[{self.name}] Last interaction: {messages[-1]}")
 
+        # TODO: refactor dependency injection
         openai = OpenaiProvider()
         next_message = openai.send_message(
             messages=messages,
@@ -530,7 +599,7 @@ class OpenPerson:
         attention: str | None = None,
         emotions: str | None = None,
     ) -> None:
-        """Update the TinyPerson's cognitive state."""
+        """Update the OpenPerson's cognitive state."""
         # Update current datetime. The passage of time is controlled by the environment, if any.
         if (
             self.environment is not None
@@ -680,12 +749,30 @@ class OpenPerson:
                 },
             )
         else:
-            pass
+            self.environment._push_and_display_latest_communication(  # noqa: SLF001
+                {
+                    "kind": kind,
+                    "rendering": rendering,
+                    "content": content,
+                    "source": source,
+                    "target": target,
+                },
+            )
 
     def _push_and_display_latest_communication(self, communication: dict) -> None:
         """Pushes the latest communications to the agent's buffer."""
         self._displayed_communications_buffer.append(communication)
         print(communication["rendering"])
+
+    def pop_latest_actions(self) -> list:
+        """
+        Returns the latest actions performed by this agent. Typically used
+        by an environment to consume the actions and provide the appropriate
+        environmental semantics to them (i.e., effects on other agents).
+        """
+        actions = self._actions_buffer
+        self._actions_buffer = []
+        return actions
 
     #############################################################################################
     # Formatting conveniences
