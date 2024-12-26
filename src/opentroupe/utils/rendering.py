@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 
 ################################################################################
@@ -15,6 +16,11 @@ def break_text_at_length(text: str | dict, max_length: int | None = None) -> str
     if max_length is None or len(text) <= max_length:
         return text
     return text[:max_length] + " (...)"
+
+
+def pretty_datetime(dt: datetime) -> str:
+    """Returns a pretty string representation of the specified datetime object."""
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 class RichTextStyle:
